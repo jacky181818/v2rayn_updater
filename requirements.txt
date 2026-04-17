@@ -1,0 +1,5 @@
+# V2RayN 自动化更新工具依赖
+
+psutil>=5.9.0
+aiohttp>=3.8.0
+toml>=0.10.2
