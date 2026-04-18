@@ -46,6 +46,16 @@ singbox_download_url = "https://www.bt.cn/api/website/test"
 # singtools 并发数量
 singbox_concurrency = 4
 
+# 代理流量验证（singbox 测速后，逐个验证节点能否访问 Google）
+verify_proxy_access = true
+verify_proxy_url = "https://www.google.com"
+verify_proxy_timeout = 10  # 验证超时时间（秒）
+verify_proxy_min_working = 3  # 最少找到几个可访问 Google 的节点（逐一测试直到达标）
+delete_failed_nodes = false  # 是否从数据库删除无法访问 Google 的节点（true=删除，false=保留仅标记）
+
+# sing-box 内核路径（用于启动临时代理验证 Google 访问）
+singbox_path = "D:\\AppBundles\\V2Ray\\bin\\sing_box\\sing-box.exe"
+
 # 自动重启 V2RayN
 auto_restart = true
 

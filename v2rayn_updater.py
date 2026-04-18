@@ -142,6 +142,14 @@ class V2RayNUpdater:
         self.singbox_download_url = self.speed_test_config.get("singbox_download_url", "https://www.bt.cn/api/website/test")
         self.singbox_concurrency = self.speed_test_config.get("singbox_concurrency", 4)
 
+        # 代理流量验证配置
+        self.verify_proxy_access = self.speed_test_config.get("verify_proxy_access", False)
+        self.verify_proxy_url = self.speed_test_config.get("verify_proxy_url", "https://www.google.com")
+        self.verify_proxy_timeout = self.speed_test_config.get("verify_proxy_timeout", 10)
+        self.verify_proxy_min_working = self.speed_test_config.get("verify_proxy_min_working", 3)
+        self.delete_failed_nodes = self.speed_test_config.get("delete_failed_nodes", False)
+        self.singbox_path = self.speed_test_config.get("singbox_path", r"D:\AppBundles\V2Ray\bin\sing_box\sing-box.exe")
+
     def _setup_logger(self) -> logging.Logger:
         """设置日志"""
         logger = logging.getLogger("V2RayNUpdater")
@@ -866,6 +874,13 @@ class V2RayNUpdater:
         new_count = sum(1 for _, _, is_new in nodes_to_save if is_new)
         self.logger.info(f"已保存 {new_count} 个新节点到数据库")
 
+    def _delete_node_from_db(self, conn: sqlite3.Connection, index_id: str):
+        """从数据库中删除指定节点"""
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM ProfileItem WHERE IndexId = ?', (index_id,))
+        cursor.execute('DELETE FROM ProfileExItem WHERE IndexId = ?', (index_id,))
+        conn.commit()
+
     def update_config(self, fastest_index_id: str = None):
         """更新 guiNConfig.json"""
         if not os.path.exists(self.config_path):
@@ -990,6 +1005,45 @@ class V2RayNUpdater:
                     else:
                         self.logger.warning(f"    {j+1}. [{n.remarks}] 超时 ✗")
 
+
+                # 代理流量验证（可选功能）
+                if self.verify_proxy_access and self.speed_mode == "singbox":
+                    self.logger.info(f"\n  验证代理流量能否访问 Google...")
+                    verified_results = self._verify_proxy_access(nodes_list, results)
+
+                    # 标记无法访问 Google 的节点，并记录其 IndexId
+                    failed_index_ids = []
+                    for i, node in enumerate(nodes_list):
+                        if i in verified_results:
+                            if not verified_results[i]:
+                                results[i] = (-2, 0.0)  # -2 表示无法访问 Google
+                            else:
+                                results[i] = (results[i][0], results[i][1])  # 保留正常延迟
+
+
+                    verified_count = sum(1 for v in verified_results.values() if v)
+                    self.logger.info(f"  代理验证完成: {verified_count}/{len(verified_results)} 可访问 Google")
+
+                    # 如果配置了删除失败节点，从数据库中删除无法访问 Google 的节点
+                    if self.delete_failed_nodes and verified_results:
+                        failed_nodes = [nodes_list[i] for i in verified_results if not verified_results[i]]
+                        if failed_nodes:
+                            self.logger.info(f"  删除 {len(failed_nodes)} 个无法访问 Google 的节点...")
+                            failed_addresses = {(n.address, n.port) for n in failed_nodes}
+                            deleted_count = 0
+
+                            # 从 merged 列表中移除要删除的节点
+                            for i in range(len(merged) - 1, -1, -1):
+                                idx_id, n, is_new = merged[i]
+                                if not is_new and (n.address, n.port) in failed_addresses:
+                                    self._delete_node_from_db(conn, idx_id)
+                                    self.logger.info(f"    已删除: [{n.remarks}] {n.address}:{n.port}")
+                                    del merged[i]
+                                    del results[i]
+                                    deleted_count += 1
+
+                            self.logger.info(f"  已从列表移除 {deleted_count} 个失败节点")
+
                 # 9. 保存到数据库
                 self.save_nodes_to_db(conn, merged, results)
 
@@ -1059,6 +1113,175 @@ class V2RayNUpdater:
         except Exception as e:
             self.logger.debug(f"  转换链接失败: {node.remarks}, {e}")
             return None
+
+    def _verify_proxy_access(self, nodes: List[NodeInfo], results: List[Tuple[int, float]]) -> dict:
+        """
+        验证节点代理流量能否访问指定 URL
+        使用 sing-box 启动临时代理进行测试
+        按延迟从低到高逐一测试，直到找到 N 个成功的节点
+        返回: {节点索引: True/False}
+        """
+        if not os.path.exists(self.singbox_path):
+            self.logger.warning(f"  sing-box 不存在: {self.singbox_path}，跳过代理验证")
+            return {}
+
+        verified = {}
+        working_count = 0
+
+        # 按延迟排序（从低到高）
+        sorted_nodes = list(enumerate(zip(nodes, results)))
+        sorted_nodes.sort(key=lambda x: x[1][1][0] if x[1][1][0] > 0 else 999999)
+
+        self.logger.info(f"  开始代理验证: 目标 {self.verify_proxy_min_working} 个可用节点...")
+
+        for idx, (node, (delay, speed)) in sorted_nodes:
+            if delay <= 0:
+                continue
+
+            port = 10808 + idx  # 每个节点使用不同端口
+            node_label = f"[{node.remarks}] {node.address}:{node.port}"
+
+            # 如果已达目标数量，停止测试
+            if working_count >= self.verify_proxy_min_working:
+                self.logger.info(f"  已找到 {working_count} 个可用节点，停止验证")
+                break
+
+            try:
+                # 生成 sing-box 配置
+                config = self._generate_singbox_config(node, port)
+
+                config_path = os.path.join(self.script_dir, f"verify_{idx}.json")
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False)
+
+                # 启动 sing-box (使用 run 子命令)
+                process = subprocess.Popen(
+                    [self.singbox_path, "run", "-c", config_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+
+                # 等待启动
+                time.sleep(2)
+
+                # curl 测试 Google
+                success = False
+                try:
+                    result = subprocess.run([
+                        "curl", "-x", f"socks5://127.0.0.1:{port}",
+                        "-o", "NUL", "-s", "-w", "%{http_code}",
+                        "--connect-timeout", str(self.verify_proxy_timeout),
+                        self.verify_proxy_url
+                    ], capture_output=True, text=True, timeout=self.verify_proxy_timeout + 2)
+
+                    if result.stdout and result.stdout.strip() == "200":
+                        success = True
+                        working_count += 1
+                        self.logger.info(f"    ✓ {node_label} 可访问 Google ({working_count}/{self.verify_proxy_min_working})")
+                    else:
+                        self.logger.warning(f"    ✗ {node_label} 无法访问 Google (HTTP {result.stdout.strip()})")
+                except Exception as curl_err:
+                    self.logger.warning(f"    ✗ {node_label} 代理测试失败: {curl_err}")
+
+                # 清理
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except:
+                    process.kill()
+                try:
+                    os.remove(config_path)
+                except:
+                    pass
+
+                verified[idx] = success
+
+            except Exception as e:
+                self.logger.warning(f"    ✗ {node_label} 验证异常: {e}")
+                verified[idx] = False
+
+        # 如果没找到足够的可用节点，警告用户
+        if working_count < self.verify_proxy_min_working:
+            self.logger.warning(f"  ⚠ 仅找到 {working_count}/{self.verify_proxy_min_working} 个可用节点，请检查节点质量或网络状态")
+
+        return verified
+
+    def _generate_singbox_config(self, node: NodeInfo, port: int) -> dict:
+        """生成 sing-box 验证配置"""
+        proto_type = {
+            1: "vmess",
+            3: "shadowsocks",
+            5: "vless",
+            6: "trojan",
+            7: "hysteria2",
+            11: "trojan",
+        }.get(node.config_type, "vless")
+
+        # 构建 outbound
+        outbound = {"tag": "proxy", "type": proto_type}
+
+        if node.config_type == 1:  # VMESS
+            outbound["server"] = node.address
+            outbound["server_port"] = node.port
+            outbound["uuid"] = node.id
+            outbound["security"] = node.security or "auto"
+        elif node.config_type == 3:  # Shadowsocks
+            outbound["server"] = node.address
+            outbound["server_port"] = node.port
+            outbound["method"] = node.security or "chacha20-poly1305"
+            outbound["password"] = node.id
+        elif node.config_type == 5:  # VLESS
+            outbound["server"] = node.address
+            outbound["server_port"] = node.port
+            outbound["uuid"] = node.id
+            if node.flow:
+                outbound["flow"] = node.flow
+        elif node.config_type == 6:  # Trojan
+            outbound["server"] = node.address
+            outbound["server_port"] = node.port
+            outbound["password"] = node.id
+        elif node.config_type == 7:  # Hysteria2
+            outbound["server"] = node.address
+            outbound["server_port"] = node.port
+            outbound["password"] = node.id
+        elif node.config_type == 11:  # AnyTLS
+            outbound["server"] = node.address
+            outbound["server_port"] = node.port
+            outbound["password"] = node.id
+
+        # 添加 TLS 配置（Reality 或 TLS）
+        if node.stream_security == "reality":
+            outbound["tls"] = {
+                "enabled": True,
+                "server_name": node.sni or node.request_host or "",
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": node.fingerprint or "chrome"
+                },
+                "reality": {
+                    "enabled": True,
+                    "public_key": node.public_key,
+                    "short_id": node.short_id
+                }
+            }
+        elif node.stream_security == "tls":
+            outbound["tls"] = {
+                "enabled": True,
+                "server_name": node.sni or node.request_host or "",
+                "fingerprint": node.fingerprint
+            }
+
+        config = {
+            "log": {"level": "error"},
+            "inbounds": [{
+                "type": "socks",
+                "listen": "127.0.0.1",
+                "listen_port": port,
+                "sniff": False
+            }],
+            "outbounds": [outbound]
+        }
+
+        return config
 
     def speed_test_with_singtools(self, nodes: List[NodeInfo]) -> List[Tuple[int, float]]:
         """使用 singtools 进行代理测速（不切换 V2RayN 节点）"""
